@@ -51,16 +51,18 @@
 #include <zlib.h>
 
 static char src_dir[PATH_MAX];
+static char temp_dir[PATH_MAX] = "/var/tmp";  /* Default: disk-backed, not tmpfs */
 
 struct chunk {
 	struct chunk * next;
-	pthread_mutex_t lock;  /* protects gzip state for thread safety */
+	pthread_mutex_t lock;    /* protects lazy decompression state change */
 
-	int fd;
-	off_t fsize;        /* uncompressed size for gzip, actual size otherwise */
-	int is_gzip;        /* 1 if this chunk is a gzip file */
-	gzFile gzfd;        /* zlib file handle for gzip files */
-	off_t gz_pos;       /* current read position in uncompressed stream */
+	int fd;                  /* temp file fd after decompress, -1 before (for gzip) */
+	int orig_fd;             /* original gzip fd (kept for lazy decompress), -1 for non-gzip */
+	off_t fsize;             /* uncompressed size */
+	int is_gzip;             /* 1 if original was gzip */
+	int decompressed;        /* 1 if already decompressed to temp */
+	char *temp_path;         /* path to temp file, NULL if not decompressed */
 };
 
 struct concat_file {
@@ -120,6 +122,65 @@ static off_t get_gzip_uncompressed_size(int fd, off_t compressed_size)
 	/* Little-endian 32-bit value */
 	size = buf[0] | (buf[1] << 8) | (buf[2] << 16) | (buf[3] << 24);
 	return (off_t)size;
+}
+
+/* Decompress gzip chunk to temp file on disk.
+   Called lazily on first read access. Frees zlib buffers immediately after.
+   Returns 0 on success, -errno on failure. */
+static int decompress_to_temp(struct chunk *c)
+{
+	char tmp_template[PATH_MAX];
+	int tmp_fd;
+	gzFile gz;
+	char buf[65536];
+	int n;
+	off_t total = 0;
+	int len;
+
+	len = snprintf(tmp_template, sizeof(tmp_template), "%s/concatfs_XXXXXX", temp_dir);
+	if (len < 0 || (size_t)len >= sizeof(tmp_template)) {
+		return -ENAMETOOLONG;
+	}
+
+	tmp_fd = mkstemp(tmp_template);
+	if (tmp_fd < 0) {
+		return -errno;
+	}
+
+	/* Use gzdopen on dup'd fd to not consume orig_fd */
+	gz = gzdopen(dup(c->orig_fd), "rb");
+	if (!gz) {
+		close(tmp_fd);
+		unlink(tmp_template);
+		return -EIO;
+	}
+
+	/* Decompress in 64KB chunks */
+	while ((n = gzread(gz, buf, sizeof(buf))) > 0) {
+		if (write(tmp_fd, buf, n) != n) {
+			gzclose(gz);
+			close(tmp_fd);
+			unlink(tmp_template);
+			return -EIO;
+		}
+		total += n;
+	}
+
+	gzclose(gz);  /* Frees zlib buffers immediately */
+
+	if (n < 0) {  /* gzread error */
+		close(tmp_fd);
+		unlink(tmp_template);
+		return -EIO;
+	}
+
+	/* Update chunk state */
+	c->temp_path = strdup(tmp_template);
+	c->fd = tmp_fd;
+	c->fsize = total;  /* Actual uncompressed size */
+	c->decompressed = 1;
+
+	return 0;
 }
 
 static struct concat_file * open_files_find(int fd)
@@ -239,37 +300,39 @@ static struct concat_file * open_concat_file(int fd, const char * path)
 			continue;
 		}
 
+		/* Explicit initialization of all fields */
 		c_n = (struct chunk *) calloc(sizeof(struct chunk), 1);
+		c_n->fd = -1;
+		c_n->orig_fd = -1;
+		c_n->is_gzip = 0;
+		c_n->decompressed = 0;
+		c_n->temp_path = NULL;
 		pthread_mutex_init(&c_n->lock, NULL);
-		c_n->fd = chunk_fd;
-		c_n->is_gzip = is_gzip_file(chunk_fd);
 
-		if (c_n->is_gzip) {
-			/* Get uncompressed size from gzip trailer */
+		if (is_gzip_file(chunk_fd)) {
+			/* Gzip chunk: defer decompression to first read */
 			chunk_size = get_gzip_uncompressed_size(chunk_fd, stbuf.st_size);
 			c_n->fsize = chunk_size;
-			c_n->gz_pos = 0;
-
-			if (fd >= 0) {
-				/* Open gzip handle for decompression */
-				c_n->gzfd = gzdopen(dup(chunk_fd), "rb");
-				if (!c_n->gzfd) {
-					close(chunk_fd);
-					free(c_n);
-					continue;
-				}
-			}
+			c_n->is_gzip = 1;
+			c_n->orig_fd = chunk_fd;  /* Keep original gz fd */
+			c_n->fd = -1;             /* Not ready yet */
+			c_n->decompressed = 0;
 		} else {
+			/* Non-gzip chunk: ready for pread immediately */
 			chunk_size = stbuf.st_size;
 			c_n->fsize = chunk_size;
-			c_n->gzfd = NULL;
+			c_n->fd = chunk_fd;       /* Ready for pread */
+			c_n->orig_fd = -1;        /* Not applicable */
+			c_n->decompressed = 1;    /* Treat as ready */
 		}
 
 		rv->fsize += chunk_size;
 
 		if (fd < 0) {
 			/* Just calculating size, close the fd */
-			close(chunk_fd);
+			if (c_n->orig_fd >= 0) close(c_n->orig_fd);
+			if (c_n->fd >= 0) close(c_n->fd);
+			pthread_mutex_destroy(&c_n->lock);
 			free(c_n);
 		} else {
 			if (c) {
@@ -294,19 +357,27 @@ static void close_concat_file(struct concat_file * cf)
 	}
 
 	for (c = cf->chunks; c;) {
-		struct chunk * t;
+		struct chunk * next = c->next;
 
-		if (c->is_gzip && c->gzfd) {
-			gzclose(c->gzfd);
+		/* Clean up temp file first */
+		if (c->temp_path) {
+			unlink(c->temp_path);
+			free(c->temp_path);
 		}
-		close(c->fd);
+
+		/* Close file descriptors */
+		if (c->orig_fd >= 0) {
+			close(c->orig_fd);
+		}
+		if (c->fd >= 0 && c->fd != c->orig_fd) {
+			close(c->fd);
+		}
+
+		/* Destroy mutex last */
 		pthread_mutex_destroy(&c->lock);
+		free(c);
 
-		t = c;
-
-		c = c->next;
-
-		free(t);
+		c = next;
 	}
 
 	close(cf->fd);
@@ -331,54 +402,33 @@ static off_t get_concat_file_size(const char * path)
 }
 
 /* Read from a chunk at the given offset within the chunk.
-   For gzip chunks, handles sequential access and position tracking.
-   Thread-safe: uses per-chunk mutex to protect gzip state. */
+   For gzip chunks, lazily decompresses to temp file on first access.
+   Thread-safe: mutex protects state transition, pread is lock-free. */
 static ssize_t read_chunk(struct chunk *c, void *buf, size_t count, off_t offset)
 {
-	ssize_t result;
+	int fd;
 
 	pthread_mutex_lock(&c->lock);
 
-	if (!c->is_gzip) {
-		/* Regular file: use pread for random access */
-		result = pread(c->fd, buf, count, offset);
-		pthread_mutex_unlock(&c->lock);
-		return result;
-	}
-
-	/* Gzip file: sequential access only */
-	if (offset < c->gz_pos) {
-		/* Need to seek backward - must rewind and skip forward */
-		gzrewind(c->gzfd);
-		c->gz_pos = 0;
-	}
-
-	/* Skip forward to desired offset if needed */
-	if (offset > c->gz_pos) {
-		char skip_buf[4096];
-		off_t to_skip = offset - c->gz_pos;
-
-		while (to_skip > 0) {
-			size_t skip_count = (to_skip > sizeof(skip_buf)) ? sizeof(skip_buf) : to_skip;
-			int rv = gzread(c->gzfd, skip_buf, skip_count);
-			if (rv <= 0) {
-				pthread_mutex_unlock(&c->lock);
-				return rv < 0 ? -EIO : 0;
-			}
-			c->gz_pos += rv;
-			to_skip -= rv;
+	/* Lazy decompress gzip on first access */
+	if (c->is_gzip && !c->decompressed) {
+		int rc = decompress_to_temp(c);
+		if (rc != 0) {
+			pthread_mutex_unlock(&c->lock);
+			return -EIO;
 		}
 	}
 
-	/* Now read the actual data */
-	int rv = gzread(c->gzfd, buf, count);
-	if (rv > 0) {
-		c->gz_pos += rv;
-	}
-	result = rv < 0 ? -EIO : rv;
-
+	/* Capture fd before releasing lock */
+	fd = c->fd;
 	pthread_mutex_unlock(&c->lock);
-	return result;
+
+	if (fd < 0) {
+		return -EIO;
+	}
+
+	/* pread is thread-safe, no lock needed */
+	return pread(fd, buf, count, offset);
 }
 
 static int read_concat_file(int fd, void *buf, size_t count, off_t offset)
