@@ -54,6 +54,7 @@ static char src_dir[PATH_MAX];
 
 struct chunk {
 	struct chunk * next;
+	pthread_mutex_t lock;  /* protects gzip state for thread safety */
 
 	int fd;
 	off_t fsize;        /* uncompressed size for gzip, actual size otherwise */
@@ -82,6 +83,17 @@ static void lock()
 static void unlock()
 {
 	pthread_mutex_unlock(&the_lock);
+}
+
+/* Build full path from src_dir and relative path.
+   Returns 0 on success, -ENAMETOOLONG if path would be truncated. */
+static int make_path(char *dest, size_t dest_size, const char *base, const char *path)
+{
+	int len = snprintf(dest, dest_size, "%s/%s", base, path);
+	if (len < 0 || (size_t)len >= dest_size) {
+		return -ENAMETOOLONG;
+	}
+	return 0;
 }
 
 /* Check if file is gzip by reading magic bytes (0x1f 0x8b) */
@@ -212,8 +224,10 @@ static struct concat_file * open_concat_file(int fd, const char * path)
 
 		if (fpath[0] == '/') {
 			strncpy(tpath, fpath, sizeof(tpath));
+			tpath[sizeof(tpath) - 1] = '\0';
 		} else {
-			snprintf(tpath, sizeof(tpath), "%s/%s",base_dir, fpath);
+			if (make_path(tpath, sizeof(tpath), base_dir, fpath) != 0)
+				continue;
 		}
 		if (stat(tpath, &stbuf) != 0) {
 			continue;
@@ -226,6 +240,7 @@ static struct concat_file * open_concat_file(int fd, const char * path)
 		}
 
 		c_n = (struct chunk *) calloc(sizeof(struct chunk), 1);
+		pthread_mutex_init(&c_n->lock, NULL);
 		c_n->fd = chunk_fd;
 		c_n->is_gzip = is_gzip_file(chunk_fd);
 
@@ -285,6 +300,7 @@ static void close_concat_file(struct concat_file * cf)
 			gzclose(c->gzfd);
 		}
 		close(c->fd);
+		pthread_mutex_destroy(&c->lock);
 
 		t = c;
 
@@ -315,12 +331,19 @@ static off_t get_concat_file_size(const char * path)
 }
 
 /* Read from a chunk at the given offset within the chunk.
-   For gzip chunks, handles sequential access and position tracking. */
+   For gzip chunks, handles sequential access and position tracking.
+   Thread-safe: uses per-chunk mutex to protect gzip state. */
 static ssize_t read_chunk(struct chunk *c, void *buf, size_t count, off_t offset)
 {
+	ssize_t result;
+
+	pthread_mutex_lock(&c->lock);
+
 	if (!c->is_gzip) {
 		/* Regular file: use pread for random access */
-		return pread(c->fd, buf, count, offset);
+		result = pread(c->fd, buf, count, offset);
+		pthread_mutex_unlock(&c->lock);
+		return result;
 	}
 
 	/* Gzip file: sequential access only */
@@ -339,6 +362,7 @@ static ssize_t read_chunk(struct chunk *c, void *buf, size_t count, off_t offset
 			size_t skip_count = (to_skip > sizeof(skip_buf)) ? sizeof(skip_buf) : to_skip;
 			int rv = gzread(c->gzfd, skip_buf, skip_count);
 			if (rv <= 0) {
+				pthread_mutex_unlock(&c->lock);
 				return rv < 0 ? -EIO : 0;
 			}
 			c->gz_pos += rv;
@@ -351,7 +375,10 @@ static ssize_t read_chunk(struct chunk *c, void *buf, size_t count, off_t offset
 	if (rv > 0) {
 		c->gz_pos += rv;
 	}
-	return rv < 0 ? -EIO : rv;
+	result = rv < 0 ? -EIO : rv;
+
+	pthread_mutex_unlock(&c->lock);
+	return result;
 }
 
 static int read_concat_file(int fd, void *buf, size_t count, off_t offset)
@@ -422,7 +449,8 @@ static int concatfs_readlink(const char *path, char *link, size_t size)
 	int rv = 0;
 	char fpath[PATH_MAX];
 
-	snprintf(fpath, sizeof(fpath), "%s/%s", src_dir, path);
+	if (make_path(fpath, sizeof(fpath), src_dir, path) != 0)
+		return -ENAMETOOLONG;
     
 	rv = readlink(fpath, link, size - 1);
 	if (rv < 0) {
@@ -437,8 +465,9 @@ static int concatfs_readlink(const char *path, char *link, size_t size)
 static int concatfs_getattr(const char *path, struct stat *stbuf)
 {
 	char fpath[PATH_MAX];
-    
-	snprintf(fpath, sizeof(fpath), "%s/%s", src_dir, path);
+
+	if (make_path(fpath, sizeof(fpath), src_dir, path) != 0)
+		return -ENAMETOOLONG;
 
 	memset(stbuf, 0, sizeof(struct stat));
 
@@ -459,8 +488,9 @@ static int concatfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	DIR *dp;
 	struct dirent *de;
 	char fpath[PATH_MAX];
-    
-	snprintf(fpath, sizeof(fpath), "%s/%s", src_dir, path);
+
+	if (make_path(fpath, sizeof(fpath), src_dir, path) != 0)
+		return -ENAMETOOLONG;
 
 	dp = opendir(fpath);
 
@@ -490,8 +520,9 @@ static int concatfs_open(const char *path, struct fuse_file_info *fi)
 {
 	int fd;
 	char fpath[PATH_MAX];
-    
-	snprintf(fpath, sizeof(fpath), "%s/%s", src_dir, path);
+
+	if (make_path(fpath, sizeof(fpath), src_dir, path) != 0)
+		return -ENAMETOOLONG;
 
 	fd = open(fpath, fi->flags);
 
@@ -558,8 +589,9 @@ static int concatfs_mknod(const char *path, mode_t mode, dev_t dev)
 {
 	int rv;
 	char fpath[PATH_MAX];
-    
-	snprintf(fpath, sizeof(fpath), "%s/%s", src_dir, path);
+
+	if (make_path(fpath, sizeof(fpath), src_dir, path) != 0)
+		return -ENAMETOOLONG;
 
 	rv = mknod(fpath, mode, dev);
 	if (rv < 0) {
@@ -572,8 +604,9 @@ static int concatfs_mkdir(const char *path, mode_t mode)
 {
 	int rv;
 	char fpath[PATH_MAX];
-    
-	snprintf(fpath, sizeof(fpath), "%s/%s", src_dir, path);
+
+	if (make_path(fpath, sizeof(fpath), src_dir, path) != 0)
+		return -ENAMETOOLONG;
 
 	rv = mkdir(fpath, mode);
 	if (rv < 0) {
@@ -586,8 +619,9 @@ static int concatfs_unlink(const char *path)
 {
 	int rv;
 	char fpath[PATH_MAX];
-    
-	snprintf(fpath, sizeof(fpath), "%s/%s", src_dir, path);
+
+	if (make_path(fpath, sizeof(fpath), src_dir, path) != 0)
+		return -ENAMETOOLONG;
 
 	rv = unlink(fpath);
 	if (rv < 0) {
@@ -600,8 +634,9 @@ static int concatfs_rmdir(const char *path)
 {
 	int rv;
 	char fpath[PATH_MAX];
-    
-	snprintf(fpath, sizeof(fpath), "%s/%s", src_dir, path);
+
+	if (make_path(fpath, sizeof(fpath), src_dir, path) != 0)
+		return -ENAMETOOLONG;
 
 	rv = rmdir(fpath);
 	if (rv < 0) {
@@ -614,8 +649,9 @@ static int concatfs_symlink(const char *path, const char * link)
 {
 	int rv;
 	char flink[PATH_MAX];
-    
-	snprintf(flink, sizeof(flink), "%s/%s", src_dir, path);
+
+	if (make_path(flink, sizeof(flink), src_dir, path) != 0)
+		return -ENAMETOOLONG;
 
 	rv = symlink(path, flink);
 	if (rv < 0) {
@@ -630,8 +666,10 @@ static int concatfs_rename(const char *path, const char *topath)
 	char fpath[PATH_MAX];
 	char ftopath[PATH_MAX];
 
-	snprintf(fpath, sizeof(fpath), "%s/%s", src_dir, path);
-	snprintf(ftopath, sizeof(ftopath), "%s/%s", src_dir, topath);
+	if (make_path(fpath, sizeof(fpath), src_dir, path) != 0)
+		return -ENAMETOOLONG;
+	if (make_path(ftopath, sizeof(ftopath), src_dir, topath) != 0)
+		return -ENAMETOOLONG;
 	
 	rv = rename(fpath, ftopath);
 	if (rv < 0) {
@@ -646,8 +684,10 @@ static int concatfs_link(const char *path, const char *topath)
 	char fpath[PATH_MAX];
 	char ftopath[PATH_MAX];
 
-	snprintf(fpath, sizeof(fpath), "%s/%s", src_dir, path);
-	snprintf(ftopath, sizeof(ftopath), "%s/%s", src_dir, topath);
+	if (make_path(fpath, sizeof(fpath), src_dir, path) != 0)
+		return -ENAMETOOLONG;
+	if (make_path(ftopath, sizeof(ftopath), src_dir, topath) != 0)
+		return -ENAMETOOLONG;
 	
 	rv = link(fpath, ftopath);
 	if (rv < 0) {
@@ -660,8 +700,9 @@ static int concatfs_chmod(const char *path, mode_t mode)
 {
 	int rv;
 	char fpath[PATH_MAX];
-    
-	snprintf(fpath, sizeof(fpath), "%s/%s", src_dir, path);
+
+	if (make_path(fpath, sizeof(fpath), src_dir, path) != 0)
+		return -ENAMETOOLONG;
 
 	rv = chmod(fpath, mode);
 	if (rv < 0) {
@@ -674,8 +715,9 @@ static int concatfs_chown(const char *path, uid_t uid, gid_t gid)
 {
 	int rv;
 	char fpath[PATH_MAX];
-    
-	snprintf(fpath, sizeof(fpath), "%s/%s", src_dir, path);
+
+	if (make_path(fpath, sizeof(fpath), src_dir, path) != 0)
+		return -ENAMETOOLONG;
 
 	rv = chown(fpath, uid, gid);
 	if (rv < 0) {
@@ -688,8 +730,9 @@ static int concatfs_truncate(const char *path, off_t nsize)
 {
 	int rv;
 	char fpath[PATH_MAX];
-    
-	snprintf(fpath, sizeof(fpath), "%s/%s", src_dir, path);
+
+	if (make_path(fpath, sizeof(fpath), src_dir, path) != 0)
+		return -ENAMETOOLONG;
 
 	rv = truncate(fpath, nsize);
 	if (rv < 0) {
@@ -702,8 +745,9 @@ static int concatfs_utime(const char *path, struct utimbuf * buf)
 {
 	int rv;
 	char fpath[PATH_MAX];
-    
-	snprintf(fpath, sizeof(fpath), "%s/%s", src_dir, path);
+
+	if (make_path(fpath, sizeof(fpath), src_dir, path) != 0)
+		return -ENAMETOOLONG;
 
 	rv = utime(fpath, buf);
 	if (rv < 0) {
@@ -716,8 +760,9 @@ static int concatfs_access(const char *path, int mask)
 {
 	int rv;
 	char fpath[PATH_MAX];
-   
-	snprintf(fpath, sizeof(fpath), "%s/%s", src_dir, path);
+
+	if (make_path(fpath, sizeof(fpath), src_dir, path) != 0)
+		return -ENAMETOOLONG;
     
 	rv = access(fpath, mask);
     
@@ -733,8 +778,9 @@ static int concatfs_create(
 {
 	int fd = 0;
 	char fpath[PATH_MAX];
-   
-	snprintf(fpath, sizeof(fpath), "%s/%s", src_dir, path);
+
+	if (make_path(fpath, sizeof(fpath), src_dir, path) != 0)
+		return -ENAMETOOLONG;
     
 	fd = creat(fpath, mode);
     
@@ -792,13 +838,19 @@ int main(int argc, char **argv)
 
 	if (argv[1][0] == '/') {
 		strncpy(src_dir, argv[1], sizeof(src_dir));
+		src_dir[sizeof(src_dir) - 1] = '\0';
 	} else {
 		char cwd[PATH_MAX];
 
-		getcwd(cwd, sizeof(cwd));
+		if (getcwd(cwd, sizeof(cwd)) == NULL) {
+			fprintf(stderr, "Failed to get current directory\n");
+			exit(-1);
+		}
 
-		snprintf(src_dir, sizeof(src_dir), "%s/%s",
-			 cwd, argv[1]);
+		if (make_path(src_dir, sizeof(src_dir), cwd, argv[1]) != 0) {
+			fprintf(stderr, "Source path too long\n");
+			exit(-1);
+		}
 	}
 
 	pthread_mutex_init(&the_lock, NULL);
