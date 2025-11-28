@@ -1,0 +1,16 @@
+# Compiled binary
+concatfs
+
+# Claude Code
+.claude/
+
+# Object files
+*.o
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Editor backups
+*.bak

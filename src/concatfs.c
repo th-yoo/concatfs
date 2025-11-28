@@ -2,8 +2,9 @@
   FUSE: Filesystem in Userspace
 
   Copyright 2015 Peter Schlaile (peter at schlaile dot de)
+  Copyright 2025 th-yoo - gzip decompression support
 
-  Files with the string "-concat-" anywhere in the filename are considered 
+  Files with the string "-concat-" anywhere in the filename are considered
   concatenation description special files.
 
   They contain a file list, which, when mounted as a fuse file system
@@ -27,7 +28,10 @@
   on seperate lines. Empty lines or lines, which do not resolve to a file where
   a stat call succeeds, are ignored.
 
-  gcc -Wall concatfs.c `pkg-config fuse --cflags --libs` -o concatfs
+  Gzip-compressed files (.gz) are automatically detected and decompressed
+  transparently during sequential reads.
+
+  gcc -Wall concatfs.c `pkg-config fuse --cflags --libs` -lz -o concatfs
 */
 
 #define FUSE_USE_VERSION 26
@@ -44,6 +48,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <dirent.h>
+#include <zlib.h>
 
 static char src_dir[PATH_MAX];
 
@@ -51,7 +56,10 @@ struct chunk {
 	struct chunk * next;
 
 	int fd;
-	off_t fsize;
+	off_t fsize;        /* uncompressed size for gzip, actual size otherwise */
+	int is_gzip;        /* 1 if this chunk is a gzip file */
+	gzFile gzfd;        /* zlib file handle for gzip files */
+	off_t gz_pos;       /* current read position in uncompressed stream */
 };
 
 struct concat_file {
@@ -74,6 +82,32 @@ static void lock()
 static void unlock()
 {
 	pthread_mutex_unlock(&the_lock);
+}
+
+/* Check if file is gzip by reading magic bytes (0x1f 0x8b) */
+static int is_gzip_file(int fd)
+{
+	unsigned char magic[2];
+	if (pread(fd, magic, 2, 0) == 2) {
+		return (magic[0] == 0x1f && magic[1] == 0x8b);
+	}
+	return 0;
+}
+
+/* Get uncompressed size from gzip trailer (last 4 bytes).
+   Note: This is modulo 2^32, so files >4GB will report incorrect size. */
+static off_t get_gzip_uncompressed_size(int fd, off_t compressed_size)
+{
+	unsigned char buf[4];
+	uint32_t size;
+
+	if (pread(fd, buf, 4, compressed_size - 4) != 4) {
+		return compressed_size; /* fallback to compressed size */
+	}
+
+	/* Little-endian 32-bit value */
+	size = buf[0] | (buf[1] << 8) | (buf[2] << 16) | (buf[3] << 24);
+	return (off_t)size;
 }
 
 static struct concat_file * open_files_find(int fd)
@@ -171,6 +205,8 @@ static struct concat_file * open_concat_file(int fd, const char * path)
 	while (fgets(fpath, sizeof(fpath), fp)) {
 		char tpath[PATH_MAX];
 		struct chunk * c_n;
+		int chunk_fd;
+		off_t chunk_size;
 
 		fpath[strlen(fpath) - 1] = 0;
 
@@ -179,18 +215,48 @@ static struct concat_file * open_concat_file(int fd, const char * path)
 		} else {
 			snprintf(tpath, sizeof(tpath), "%s/%s",base_dir, fpath);
 		}
-		if (stat(tpath, &stbuf) == 0) {
-			rv->fsize += stbuf.st_size;
-		} else {
+		if (stat(tpath, &stbuf) != 0) {
 			continue;
 		}
 
-		if (fd >= 0) {
-			c_n = (struct chunk *) calloc(sizeof(struct chunk), 1);
+		/* Open chunk file to check if it's gzip */
+		chunk_fd = open(tpath, O_RDONLY);
+		if (chunk_fd < 0) {
+			continue;
+		}
 
-			c_n->fsize = stbuf.st_size;
-			c_n->fd = open(tpath, O_RDONLY);
+		c_n = (struct chunk *) calloc(sizeof(struct chunk), 1);
+		c_n->fd = chunk_fd;
+		c_n->is_gzip = is_gzip_file(chunk_fd);
 
+		if (c_n->is_gzip) {
+			/* Get uncompressed size from gzip trailer */
+			chunk_size = get_gzip_uncompressed_size(chunk_fd, stbuf.st_size);
+			c_n->fsize = chunk_size;
+			c_n->gz_pos = 0;
+
+			if (fd >= 0) {
+				/* Open gzip handle for decompression */
+				c_n->gzfd = gzdopen(dup(chunk_fd), "rb");
+				if (!c_n->gzfd) {
+					close(chunk_fd);
+					free(c_n);
+					continue;
+				}
+			}
+		} else {
+			chunk_size = stbuf.st_size;
+			c_n->fsize = chunk_size;
+			c_n->gzfd = NULL;
+		}
+
+		rv->fsize += chunk_size;
+
+		if (fd < 0) {
+			/* Just calculating size, close the fd */
+			close(chunk_fd);
+			free(c_n);
+		} else {
 			if (c) {
 				c->next = c_n;
 			} else {
@@ -215,8 +281,11 @@ static void close_concat_file(struct concat_file * cf)
 	for (c = cf->chunks; c;) {
 		struct chunk * t;
 
+		if (c->is_gzip && c->gzfd) {
+			gzclose(c->gzfd);
+		}
 		close(c->fd);
-		
+
 		t = c;
 
 		c = c->next;
@@ -225,7 +294,7 @@ static void close_concat_file(struct concat_file * cf)
 	}
 
 	close(cf->fd);
-	
+
 	free(cf);
 }
 
@@ -245,6 +314,46 @@ static off_t get_concat_file_size(const char * path)
 	return rv;
 }
 
+/* Read from a chunk at the given offset within the chunk.
+   For gzip chunks, handles sequential access and position tracking. */
+static ssize_t read_chunk(struct chunk *c, void *buf, size_t count, off_t offset)
+{
+	if (!c->is_gzip) {
+		/* Regular file: use pread for random access */
+		return pread(c->fd, buf, count, offset);
+	}
+
+	/* Gzip file: sequential access only */
+	if (offset < c->gz_pos) {
+		/* Need to seek backward - must rewind and skip forward */
+		gzrewind(c->gzfd);
+		c->gz_pos = 0;
+	}
+
+	/* Skip forward to desired offset if needed */
+	if (offset > c->gz_pos) {
+		char skip_buf[4096];
+		off_t to_skip = offset - c->gz_pos;
+
+		while (to_skip > 0) {
+			size_t skip_count = (to_skip > sizeof(skip_buf)) ? sizeof(skip_buf) : to_skip;
+			int rv = gzread(c->gzfd, skip_buf, skip_count);
+			if (rv <= 0) {
+				return rv < 0 ? -EIO : 0;
+			}
+			c->gz_pos += rv;
+			to_skip -= rv;
+		}
+	}
+
+	/* Now read the actual data */
+	int rv = gzread(c->gzfd, buf, count);
+	if (rv > 0) {
+		c->gz_pos += rv;
+	}
+	return rv < 0 ? -EIO : rv;
+}
+
 static int read_concat_file(int fd, void *buf, size_t count, off_t offset)
 {
 	struct concat_file * cf = open_files_find(fd);
@@ -258,37 +367,42 @@ static int read_concat_file(int fd, void *buf, size_t count, off_t offset)
 	if (offset > cf->fsize) {
 		return 0;
 	}
-	
+
 	c = cf->chunks;
 
-	for (; c && offset > c->fsize; c = c->next) {
+	/* Skip chunks until we find the one containing our offset */
+	for (; c && offset >= c->fsize; c = c->next) {
 		offset -= c->fsize;
 	}
 
-	for (; c && count > c->fsize - offset; c = c->next) {
-		ssize_t rv = pread(c->fd, buf, c->fsize - offset, offset);
+	/* Read across multiple chunks if needed */
+	while (c && count > 0) {
+		size_t to_read = count;
+		ssize_t rv;
 
-		if (rv == c->fsize - offset) {
+		if (to_read > c->fsize - offset) {
+			to_read = c->fsize - offset;
+		}
+
+		rv = read_chunk(c, buf, to_read, offset);
+
+		if (rv > 0) {
 			buf += rv;
-			offset = 0;
+			bytes_read += rv;
 			count -= rv;
-			bytes_read += rv;
-		} else if (rv > 0) {
-			bytes_read += rv;
+			offset = 0;
+			if (rv < to_read) {
+				/* Short read, return what we have */
+				return bytes_read;
+			}
+			c = c->next;
+		} else if (rv == 0) {
+			/* EOF */
 			return bytes_read;
 		} else {
-			return -errno;
+			/* Error */
+			return rv;
 		}
-	}
-	
-	if (c && count > 0) {
-		ssize_t rv = pread(c->fd, buf, count, offset);
-
-		if (rv < 0) {
-			return -errno;
-		}
-
-		bytes_read += rv;
 	}
 
 	return bytes_read;
